@@ -1732,13 +1732,9 @@ def main(argv=None):
                 if len(names) > 1:
                     progress(f"== {a.cmd} {fn} ({i+1}/{len(names)}) ==")
                 if a.cmd == "validate":
-                    ok, result = beta_cmd(conn, action, {"configuration": fn})
-                    if ok:
-                        out({"ok": True, "name": fn, "result": result},
-                            f"[{a.cmd}] {fn}: OK")
-                    else:
-                        out({"ok": False, "name": fn, "error": result},
-                            f"[{a.cmd}] {fn}: FAILED")
+                    res = beta_stream_command(conn, action, {"configuration": fn}, name=fn, action=a.cmd)
+                    print_build_result(res, a.cmd)
+                    if not res["ok"]:
                         all_ok = False
                 else:
                     job_id = beta_compile(conn, fn)
