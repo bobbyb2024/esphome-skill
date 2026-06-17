@@ -68,41 +68,109 @@ format are in `references/fleet-policy.md`.
 
 ## First-time setup (once per Builder)
 
-All connection settings live in a `.env` file — nothing is hardcoded. Ask the
-user for host/IP, port (default `6052`), http vs https, whether auth is required
-(username/password; not needed for HA add-on ingress or "leave_front_door_open"),
-and whether TLS is self-signed. Have the **user** fill in `.env` (especially the
-password — the agent doesn't need to handle it):
+All connection settings live in a `.env` file — nothing is hardcoded. Preferred
+path for a Home Assistant add-on install is **HA ingress**: set
+`ESPHOME_HA_URL`, `ESPHOME_HA_TOKEN` (a Home Assistant long-lived access token),
+and usually leave `ESPHOME_HA_ADDON_SLUG=5c53de3b_esphome`. The tool opens
+Home Assistant's `/api/websocket`, calls the `supervisor/api` command
+`/ingress/session`, then calls Builder endpoints under
+`/api/hassio_ingress/<token>/...` with `Cookie: ingress_session=<session>`.
+If ingress setup fails and `ESPHOME_DASHBOARD_URL` is also configured, it falls
+back to direct Builder access on port `6052`.
+
+Ask the user for Home Assistant URL/token for ingress and (for fallback) direct
+Builder host/IP, port (default `6052`), http vs https, whether direct auth is
+required (username/password; not needed for HA add-on ingress or
+"leave_front_door_open"), and whether TLS is self-signed. Have the **user** fill
+in `.env` (especially tokens/passwords — the agent doesn't need to handle them):
 
 ```bash
-cp .env.example .env        # then edit: ESPHOME_DASHBOARD_URL, _USERNAME, _PASSWORD, _INSECURE
+cp .env.example .env        # edit ESPHOME_HA_* first; optionally ESPHOME_DASHBOARD_* fallback
 chmod 600 .env              # and add .env to .gitignore
-python3 scripts/esphome_dashboard.py connect      # reads .env, verifies auth
+python3 scripts/esphome_dashboard.py connect      # tries HA ingress, then direct fallback
 python3 scripts/esphome_dashboard.py enumerate --save   # cache the live API map
 ```
 
 Settings resolve in precedence order: CLI flags > real environment > `.env`
 (searched as `--env-file` → `$ESPHOME_BUILDER_ENV` → `./.env` →
-`~/.config/esphome-builder/.env`). `connect --save` writes the variables back
-into `.env` (chmod 600), preserving other lines. Auth is sent as HTTP Basic on
-every request and the WS handshake. These Builder credentials are separate from
-device `!secret` values, which stay in the Builder's `secrets.yaml`.
+`~/.config/esphome-builder/.env`). `connect --save` writes the active connection
+variables back into `.env` (chmod 600), preserving other lines. Direct Builder
+auth is sent as HTTP Basic; HA ingress auth uses the Home Assistant WebSocket
+API to create a short-lived ingress session cookie. These Builder credentials
+are separate from device `!secret` values, which stay in the Builder's
+`secrets.yaml`.
 
 ## Orientation (run `--help` for flags)
 
+* **Connection:** `connect`, `enumerate`
 * **Inventory / health:** `list`, `status`, `info NAME`, `classify [NAME|--all]`,
-  `enumerate`, `secrets`, `downloads NAME`
+  `enumerate`, `secrets`, `downloads NAME`, `serial-ports`
 * **Author / change:** `get`, `put`, `create`, `clone`, `rename`, `delete`,
-  `lint -f FILE`, `secrets --check NAME`
+  `lint -f FILE`, `secrets --check NAME`, `diff NAME LOCAL`
+* **Validate before save:** `validate -f LOCAL [--name NAME]` — uses beta
+  `editor/validate_yaml` to check unsaved content before `put`
 * **Build / deploy:** `validate`, `compile`, `upload`, `logs`, `run`, `clean`,
   `update-all` — all accept `--match GLOB` for batches; `compile`/`upload`
   summarize output to a log file by default (use `--verbose` to stream)
-* **Operate:** `backup [--out DIR --match GLOB]`, `watch NAME` (online after OTA)
+* **Operate:** `backup [--out DIR --match GLOB]`, `watch NAME` (online after OTA),
+  `serial-ports` (USB flash candidates)
+* **Review:** `get --diff LOCAL` — unified diff of Builder vs local config
 
 Add `--json` to any command for machine-parseable output. `logs`/`run` are
 bounded by default (`--duration`/`--lines`/`--until`; `--follow` to disable) so
 streaming can't hang a turn.
 
+**Beta auto-detection:** `connect` probes the `/ws` endpoint. If available,
+`compile`/`validate`/`upload` auto-select the beta API — no `--beta` flag needed.
+Pass `--beta` to force beta mode (e.g. on a Builder that exposes both old and
+new APIs). `get`/`put` auto-detect SPA HTML responses and fall back to beta
+`devices/get_config`/`devices/update_config`.
+
 See `references/workflows.md` for end-to-end recipes (create, modify, clone,
 canary fleet update, backup), `references/fleet-policy.md` for the class policy,
 and `references/dashboard-api.md` only when debugging or extending the API.
+
+## Builder Beta API (ESPHome Device Builder 2026.6+)
+
+The newer "Device Builder" ESPHome add-on (beta, slug `5c53de3b_esphome-beta`)
+uses a different WebSocket protocol and a single `/ws` endpoint. Pass `--beta`
+to any build/deploy command to use the beta API:
+
+* **WS endpoint:** `ws://...{ingress}/ws`
+* **Format:** `{"command": "<name>", "message_id": "<id>", "args": {<params>}}`
+  (NOT the old `{"type": "..."}` format)
+* **Read YAML:** `devices/get_config` — result is the raw YAML string
+* **Save YAML:** `devices/update_config {configuration, content}` — writes the config
+* **Validate:** `devices/validate {configuration}` — streaming events
+* **Compile:** `firmware/compile {configuration}` → returns `{job_id}`
+* **Follow build:** `firmware/follow_job {job_id}` → streaming line/exit events
+
+The `get`/`put`/`clone`/`backup`/`classify`/`secrets --check` commands
+**auto-detect** when the old `/edit` HTTP endpoint returns SPA HTML and
+automatically fall back to the beta `devices/get_config` / `devices/update_config`
+WebSocket commands. No `--beta` flag is needed for config read/write.
+
+For compile/upload/validate, use `--beta` to force the new API, or rely on auto-
+detection for `get`/`put`. The `--beta` flag also switches `list` to use
+`devices/list` on the beta `/ws` endpoint. Direct HTTP endpoints that work on
+both old and beta Builders (`/devices`, `/json-config`, `/version`, `/ping`) do
+not need the `--beta` flag.
+
+Example beta workflow:
+
+```bash
+# Connect via HA ingress (auto-detects beta)
+python3 scripts/esphome_dashboard.py connect
+
+# Read a config (auto-fallbacks if /edit returns HTML)
+python3 scripts/esphome_dashboard.py get kitchen-streamer
+
+# Validate using beta WS API explicitly
+python3 scripts/esphome_dashboard.py validate kitchen-streamer --beta
+
+# Compile + follow with beta WS API
+python3 scripts/esphome_dashboard.py compile kitchen-streamer --beta
+
+# Or just use upload which also compiles via beta
+python3 scripts/esphome_dashboard.py upload kitchen-streamer --beta
+```

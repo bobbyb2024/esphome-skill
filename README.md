@@ -28,7 +28,8 @@ Generated archives belong in `dist/` and are not committed.
 cd esphome-builder
 cp .env.example .env
 chmod 600 .env
-# Fill in ESPHOME_DASHBOARD_URL and optional Builder auth yourself.
+# Fill ESPHOME_HA_URL + ESPHOME_HA_TOKEN for Home Assistant ingress first.
+# Optionally fill ESPHOME_DASHBOARD_URL/credentials for direct :6052 fallback.
 python3 scripts/esphome_dashboard.py connect
 python3 scripts/esphome_dashboard.py enumerate --save
 python3 scripts/esphome_dashboard.py status
