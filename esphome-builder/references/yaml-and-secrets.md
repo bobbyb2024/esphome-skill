@@ -66,10 +66,16 @@ never read.
 * After editing, `lint`, then `validate`. Show the user the diff if the change
   is non-trivial.
 
-## esphome.io documentation map (source of truth)
+## ESPHome docs and code source of truth
 
-Resolve component names, options, platforms, and board IDs from the docs, not
-from memory. Key entry points:
+Use https://esphome.io/ as the single source of truth for ESPHome documentation:
+component names, options, platforms, board IDs, YAML schema, and migration notes.
+Use https://github.com/esphome/esphome as the single source of truth for ESPHome
+code behavior when docs are incomplete. Issues and PRs may be researched and can
+inform a fix, but the default is always official docs and source code over
+memory, blogs, snippets, or secondary summaries.
+
+Key documentation entry points:
 
 * Index of all components: https://esphome.io/index.html
 * Core config & `esphome:` block: https://esphome.io/components/esphome.html
@@ -85,6 +91,7 @@ from memory. Key entry points:
 * CLI reference: https://esphome.io/guides/cli.html
 * Security best practices: https://esphome.io/guides/security_best_practices/
 * FAQ (troubleshooting): https://esphome.io/guides/faq.html
+* ESPHome source repository: https://github.com/esphome/esphome
 
 Per-platform board IDs (ESP32/ESP8266/RP2040/etc.) are linked from each
 platform's page under https://esphome.io/components/esp32.html and friends; the

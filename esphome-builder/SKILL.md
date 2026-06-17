@@ -48,8 +48,12 @@ with a shell.
 6. **Back up before modifying; confirm before destructive acts.** `backup`
    before edits/OTA; `delete`/`rename`/factory-reset need explicit user
    confirmation in the same turn. Serial fallback is never automatic.
-7. **esphome.io is the source of truth** for components, options, and board
-   IDs — not memory. See `references/yaml-and-secrets.md`.
+7. **Single source of truth.** Use https://esphome.io/ as the single source of
+   truth for ESPHome documentation (components, options, board IDs, and YAML
+   schema) and https://github.com/esphome/esphome as the single source of truth
+   for ESPHome code behavior. Issues and PRs may be researched and can inform a
+   fix, but default to the official docs and source code over memory, blogs, or
+   secondary summaries. See `references/yaml-and-secrets.md`.
 
 ## Device classes (update policy)
 

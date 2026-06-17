@@ -95,6 +95,13 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+class BuilderHTTPError(Exception):
+    def __init__(self, status, body=b""):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.body = body
+
+
 def out(obj_for_json, text_for_human=None):
     if _JSON:
         print(json.dumps(obj_for_json, indent=2, sort_keys=True, default=str))
@@ -450,10 +457,19 @@ def _default_log_path(name, action):
     base = os.environ.get("ESPHOME_BUILDER_LOG_DIR",
                           os.path.join(os.path.expanduser("~"), ".cache",
                                        "esphome-builder", "logs"))
-    os.makedirs(base, exist_ok=True)
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(base, 0o700)
+    except OSError:
+        pass
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name or action)
     return os.path.join(base, f"{safe}-{action}-{stamp}.log")
+
+
+def _open_private_text(path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
 
 
 def stream_command(conn, ws_path, spawn, *, mode="summary", tail=40, log_path=None,
@@ -470,7 +486,7 @@ def stream_command(conn, ws_path, spawn, *, mode="summary", tail=40, log_path=No
     until_re = re.compile(until) if until else None
     if log_path is None and mode == "summary":
         log_path = _default_log_path(name, action)
-    logf = open(log_path, "w", encoding="utf-8") if log_path else None
+    logf = _open_private_text(log_path) if log_path else None
     recent = deque(maxlen=max(tail, 60))
     errors = []
     count = 0
@@ -517,7 +533,15 @@ def stream_command(conn, ws_path, spawn, *, mode="summary", tail=40, log_path=No
         ws.close()
         if logf:
             logf.close()
-    ok = (code == 0) if stopped == "exit" else (stopped in ("duration", "lines", "until"))
+    if stopped == "exit":
+        ok = (code == 0)
+    elif action == "logs":
+        # Bounded log sampling is a successful read. For build/deploy commands
+        # (especially `run`), a bound hit before an exit event is indeterminate
+        # and must not be reported as a successful compile/upload.
+        ok = stopped in ("duration", "lines", "until")
+    else:
+        ok = False
     result = {"command": action, "name": name, "exit_code": code, "ok": ok,
               "stopped": stopped, "lines": count, "log_file": log_path}
     if mode == "summary":
@@ -623,6 +647,18 @@ def lint_yaml(text):
     return findings
 
 
+def assert_config_save_allowed(text, *, allow_secrets=False):
+    findings = lint_yaml(text)
+    if findings and not allow_secrets:
+        msg = ["refusing to save: config appears to contain inline secrets."]
+        for ln, _, reason in findings:
+            msg.append(f"  line {ln}: {reason}")
+        msg.append("Move these into the Builder's secrets.yaml and reference with "
+                   "`!secret <name>`, or pass --allow-secrets to override.")
+        die("\n".join(msg))
+    return findings
+
+
 # --------------------------------------------------------------------------- #
 # config CRUD
 # --------------------------------------------------------------------------- #
@@ -651,35 +687,42 @@ def get_config(conn, name):
     return get_text(conn, "/edit", params={"configuration": norm(name)})
 
 
-def put_config(conn, name, text, *, allow_secrets=False):
-    findings = lint_yaml(text)
-    if findings and not allow_secrets:
-        msg = ["refusing to save: config appears to contain inline secrets."]
-        for ln, _, reason in findings:
-            msg.append(f"  line {ln}: {reason}")
-        msg.append("Move these into the Builder's secrets.yaml and reference with "
-                   "`!secret <name>`, or pass --allow-secrets to override.")
-        die("\n".join(msg))
+def _post_config(conn, name, text):
     s, h, b = http_request(conn, "POST", "/edit", params={"configuration": norm(name)},
                            body=text, headers={"Content-Type": "text/plain; charset=utf-8"})
     if s == 401 or _login_redirect(s, h):
         die("authentication required to save config.")
     if s >= 400:
-        die(f"save failed: HTTP {s}: {b[:300].decode('utf-8','replace')}")
+        raise BuilderHTTPError(s, b)
     return True
 
 
+def put_config(conn, name, text, *, allow_secrets=False):
+    assert_config_save_allowed(text, allow_secrets=allow_secrets)
+    try:
+        return _post_config(conn, name, text)
+    except BuilderHTTPError as exc:
+        die(f"save failed: HTTP {exc.status}: {exc.body[:300].decode('utf-8','replace')}")
+
+
 def create_from_file(conn, name, text, *, force=False, allow_secrets=False):
+    assert_config_save_allowed(text, allow_secrets=allow_secrets)
     if not force and exists(conn, name):
         die(f"'{norm(name)}' already exists. Use --force to overwrite, or `put` to edit.")
     try:
-        put_config(conn, name, text, allow_secrets=allow_secrets)
+        _post_config(conn, name, text)
         return "edit"
-    except SystemExit:
+    except BuilderHTTPError as exc:
+        if exc.status != 404:
+            die(f"save failed: HTTP {exc.status}: {exc.body[:300].decode('utf-8','replace')}")
         # Some Builder versions won't create a brand-new file via /edit.
         # Fall back to wizard(empty) to create the file, then write content.
         create_via_wizard(conn, name, wtype="empty")
-        put_config(conn, name, text, allow_secrets=allow_secrets)
+        try:
+            _post_config(conn, name, text)
+        except BuilderHTTPError as second_exc:
+            die(f"save failed after wizard fallback: HTTP {second_exc.status}: "
+                f"{second_exc.body[:300].decode('utf-8','replace')}")
         return "wizard+edit"
 
 
@@ -847,6 +890,21 @@ def fleet_status(conn):
     return {"builder_version": current, "devices": rows}
 
 
+def safe_configuration_filename(name):
+    cfg = norm(name)
+    normalized = cfg.replace("\\", "/")
+    if (
+        not cfg
+        or normalized != os.path.basename(normalized)
+        or normalized in (".", "..")
+        or os.path.isabs(cfg)
+        or "/" in normalized
+        or ".." in normalized.split("/")
+    ):
+        die(f"unsafe configuration filename from Builder: {name!r}")
+    return cfg
+
+
 def backup_all(conn, out_dir, match=None):
     os.makedirs(out_dir, exist_ok=True)
     names = configured_filenames(conn)
@@ -854,18 +912,23 @@ def backup_all(conn, out_dir, match=None):
         names = [n for n in names if fnmatch.fnmatch(n, match) or fnmatch.fnmatch(n[:-5], match)]
     written, manifest = [], []
     for fn in names:
+        safe_fn = safe_configuration_filename(fn)
         text = get_config(conn, fn)
-        path = os.path.join(out_dir, fn)
+        findings = lint_yaml(text)
+        path = os.path.join(out_dir, safe_fn)
         os.makedirs(os.path.dirname(path) or out_dir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         written.append(path)
         manifest.append({"configuration": fn, "bytes": len(text),
-                         "secret_refs": secret_refs(text)})
+                         "secret_refs": secret_refs(text),
+                         "inline_secret_findings": len(findings)})
     with open(os.path.join(out_dir, "MANIFEST.json"), "w", encoding="utf-8") as fh:
         json.dump({"builder": conn.origin, "saved": _dt.datetime.now().isoformat(),
                    "files": manifest}, fh, indent=2)
-    return written
+    files = [dict(item, path=path) for item, path in zip(manifest, written)]
+    return {"paths": written, "files": files,
+            "inline_secret_findings_total": sum(item["inline_secret_findings"] for item in manifest)}
 
 
 def watch_device(conn, name, timeout=180):
@@ -936,6 +999,19 @@ def _maybe_json(a):
         _JSON = True
 
 
+def _matches_confirm(value, name):
+    if not value:
+        return False
+    target = norm(name)
+    stem = target[:-5] if target.endswith(".yaml") else target
+    return value in {name, target, stem} or norm(value) == target
+
+
+def require_confirm(value, name, action):
+    if not _matches_confirm(value, name):
+        die(f"{action} requires --confirm {norm(name)}")
+
+
 def build_parser():
     P = argparse.ArgumentParser(prog="esphome_dashboard.py",
                                 description="Manage ESPHome devices and fleets via the ESPHome Builder.")
@@ -985,10 +1061,12 @@ def build_parser():
 
     def del_args(s):
         s.add_argument("name"); s.add_argument("--undo", action="store_true")
+        s.add_argument("--confirm", help="repeat NAME or NAME.yaml to confirm")
     cmd("delete", "delete/restore a device", del_args)
 
     def rename_args(s):
         s.add_argument("name"); s.add_argument("new_name")
+        s.add_argument("--confirm", help="repeat current NAME or NAME.yaml to confirm")
     cmd("rename", "rename a device", rename_args)
 
     def target_args(s):
@@ -1018,7 +1096,9 @@ def build_parser():
         s.add_argument("--verbose", action="store_true")
     cmd("run", "compile + upload + logs (prefer compile/upload/logs for agents)", run_args)
 
-    cmd("update-all", "update every device to the current ESPHome version")
+    def update_all_args(s):
+        s.add_argument("--confirm", help="pass update-all to confirm fleet-wide update")
+    cmd("update-all", "update every device to the current ESPHome version", update_all_args)
 
     def classify_args(s):
         s.add_argument("name", nargs="?")
@@ -1058,16 +1138,16 @@ def run_target_batch(conn, a, ws_path, label, mode="summary", **stream_kw):
             progress(f"== {label} {fn} ({len(results)+1}/{len(targets)}) ==")
         spawn = {"configuration": fn}
         if "port" in stream_kw:
-            spawn["port"] = stream_kw.pop("port")
+            spawn["port"] = stream_kw["port"]
         res = stream_command(conn, ws_path, spawn, mode=mode, action=label, name=fn,
                              **{k: v for k, v in stream_kw.items() if k in
                                 ("tail", "log_path", "duration", "lines", "until")})
         results.append(res)
-        if mode == "summary":
+        if mode == "summary" and not _JSON:
             print_build_result(res, label)
-    if _JSON:
-        out({"command": label, "results": results})
     fails = [r for r in results if not r["ok"]]
+    if _JSON:
+        out({"command": label, "ok": not fails, "results": results})
     return 0 if not fails else 1
 
 
@@ -1094,6 +1174,15 @@ def main(argv=None):
         out(r, f"{a.file}: {cls}\n  {rat}")
         return 0
 
+    # Destructive/fleet-wide confirmations are local argument checks and should
+    # fail before connection lookup, so a missing .env cannot mask the safety refusal.
+    if a.cmd == "delete":
+        require_confirm(a.confirm, a.name, "delete")
+    if a.cmd == "rename":
+        require_confirm(a.confirm, a.name, "rename")
+    if a.cmd == "update-all" and a.confirm != "update-all":
+        die("update-all requires --confirm update-all")
+
     conn = conn_from(a)
 
     if a.cmd == "connect":
@@ -1115,7 +1204,8 @@ def main(argv=None):
         return 0
 
     if a.cmd == "list":
-        out(list_devices(conn), json.dumps(list_devices(conn), indent=2))
+        devices = list_devices(conn)
+        out(devices, json.dumps(devices, indent=2))
         return 0
 
     if a.cmd == "status":
@@ -1136,8 +1226,8 @@ def main(argv=None):
         return 0
 
     if a.cmd == "info":
-        out(get_json(conn, "/info", params={"configuration": norm(a.name)}),
-            json.dumps(get_json(conn, "/info", params={"configuration": norm(a.name)}), indent=2))
+        info = get_json(conn, "/info", params={"configuration": norm(a.name)})
+        out(info, json.dumps(info, indent=2))
         return 0
 
     if a.cmd == "get":
@@ -1188,12 +1278,14 @@ def main(argv=None):
         return 0
 
     if a.cmd == "delete":
+        require_confirm(a.confirm, a.name, "delete")
         delete_config(conn, a.name, undo=a.undo)
         out({"ok": True, "name": norm(a.name), "undo": a.undo},
             f"{'restored' if a.undo else 'deleted'} {norm(a.name)}")
         return 0
 
     if a.cmd == "rename":
+        require_confirm(a.confirm, a.name, "rename")
         res = stream_command(conn, "/rename",
                              {"configuration": norm(a.name), "newName": a.new_name},
                              mode="summary", action="rename", name=norm(a.name))
@@ -1212,7 +1304,7 @@ def main(argv=None):
         ws = {"logs": "/logs", "run": "/run"}[a.cmd]
         duration = None if a.follow else a.duration
         lines = None if a.follow else a.lines
-        if a.cmd == "logs" and not a.follow and not duration and not lines and not a.until:
+        if a.cmd in ("logs", "run") and not a.follow and not duration and not lines and not a.until:
             duration, lines = 60, 80  # safe default bound for agents
         mode = "stream"
         if a.cmd == "run" and getattr(a, "verbose", False):
@@ -1228,6 +1320,8 @@ def main(argv=None):
         return 0 if res["ok"] else 1
 
     if a.cmd == "update-all":
+        if a.confirm != "update-all":
+            die("update-all requires --confirm update-all")
         res = stream_command(conn, "/update-all", {}, mode="summary",
                              action="update-all", name="fleet")
         print_build_result(res, "update-all")
@@ -1281,9 +1375,12 @@ def main(argv=None):
         return 0
 
     if a.cmd == "backup":
-        written = backup_all(conn, a.out, match=a.match)
-        out({"ok": True, "out": a.out, "files": written},
-            f"backed up {len(written)} config(s) to {a.out}")
+        backup = backup_all(conn, a.out, match=a.match)
+        result = {"ok": True, "out": a.out, **backup}
+        warning = ""
+        if backup["inline_secret_findings_total"]:
+            warning = f"; WARNING: {backup['inline_secret_findings_total']} inline secret finding(s)"
+        out(result, f"backed up {len(backup['paths'])} config(s) to {a.out}{warning}")
         return 0
 
     if a.cmd == "watch":

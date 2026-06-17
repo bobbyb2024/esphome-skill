@@ -1,0 +1,6 @@
+# Never commit real connection settings or local artifacts
+.env
+*.env
+!.env.example
+esphome-backup/
+capabilities.json
