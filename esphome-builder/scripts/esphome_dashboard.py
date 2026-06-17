@@ -1891,11 +1891,15 @@ def main(argv=None):
 
     if a.cmd == "downloads":
         s, h, b = http_request(conn, "GET", "/downloads", params={"configuration": norm(a.name)})
-        if _is_html_response(s, h, b):
+        if s == 401 or _login_redirect(s, h):
+            die("authentication required/failed. Provide --username/--password.")
+        if s < 400 and _is_html_response(s, h, b):
             out({"ok": True, "name": norm(a.name), "downloads": [],
-                 "note": "/downloads endpoint returned HTML (beta Builder). Use `upload --beta` for OTA, or access the Builder web UI for binary downloads."},
+                 "note": "/downloads endpoint returned HTML (beta Builder). Use 'upload --beta' for OTA, or access the Builder web UI for binary downloads."},
                 f"{norm(a.name)}: binary downloads not available via beta API — use upload --beta for OTA flash")
             return 0
+        if s >= 400:
+            die(f"GET /downloads -> HTTP {s}: {b[:300].decode('utf-8','replace')}")
         try:
             d = json.loads(b.decode("utf-8", "replace") or "null")
         except json.JSONDecodeError:
