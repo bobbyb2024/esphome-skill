@@ -783,7 +783,7 @@ def _stream_events(ws, *, mode="summary", tail=40, log_path=None,
             if msg is None:
                 stopped = "closed"; break
             ev = msg.get("event")
-            if ev == "line":
+            if ev in ("line", "output"):
                 line = msg.get("data", "")
                 count += 1
                 if logf:
@@ -818,6 +818,8 @@ def _stream_events(ws, *, mode="summary", tail=40, log_path=None,
             logf.close()
     if stopped == "exit":
         ok = (code == 0)
+    elif stopped == "done":
+        ok = True
     elif action == "logs":
         ok = stopped in ("duration", "lines", "until")
     else:
@@ -1888,7 +1890,16 @@ def main(argv=None):
         return 0 if ok else 1
 
     if a.cmd == "downloads":
-        d = get_json(conn, "/downloads", params={"configuration": norm(a.name)})
+        s, h, b = http_request(conn, "GET", "/downloads", params={"configuration": norm(a.name)})
+        if _is_html_response(s, h, b):
+            out({"ok": True, "name": norm(a.name), "downloads": [],
+                 "note": "/downloads endpoint returned HTML (beta Builder). Use `upload --beta` for OTA, or access the Builder web UI for binary downloads."},
+                f"{norm(a.name)}: binary downloads not available via beta API — use upload --beta for OTA flash")
+            return 0
+        try:
+            d = json.loads(b.decode("utf-8", "replace") or "null")
+        except json.JSONDecodeError:
+            d = {}
         out(d, json.dumps(d, indent=2))
         return 0
 
