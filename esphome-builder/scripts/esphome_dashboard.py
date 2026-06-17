@@ -151,10 +151,11 @@ def load_env_files(explicit=None):
     """Populate os.environ from .env files without overriding real env vars.
     Precedence (high->low): real env, --env-file/$ESPHOME_BUILDER_ENV, ./.env,
     ~/.config/esphome-builder/.env. Returns the list of files loaded."""
+    e = os.environ.get
     candidates = []
     if explicit:
         candidates.append(explicit)
-    if os.environ.get(ENV_FILE_ENV):
+    if e(ENV_FILE_ENV):
         candidates.append(os.environ[ENV_FILE_ENV])
     candidates.append(os.path.join(os.getcwd(), ".env"))
     candidates.append(DEFAULT_ENV)
@@ -168,9 +169,10 @@ def load_env_files(explicit=None):
 
 
 def default_save_env_path(explicit=None):
+    e = os.environ.get
     if explicit:
         return explicit
-    if os.environ.get(ENV_FILE_ENV):
+    if e(ENV_FILE_ENV):
         return os.environ[ENV_FILE_ENV]
     cwd_env = os.path.join(os.getcwd(), ".env")
     if os.path.exists(cwd_env):
@@ -294,15 +296,16 @@ class Conn:
     def load(cls, url=None, username=None, password=None, insecure=None,
              ha_url=None, ha_token=None, ha_addon_slug=None):
         # All settings come from variables (real env or a loaded .env file).
-        url = url or os.environ.get("ESPHOME_DASHBOARD_URL")
-        username = username if username is not None else os.environ.get("ESPHOME_DASHBOARD_USERNAME")
-        password = password if password is not None else os.environ.get("ESPHOME_DASHBOARD_PASSWORD")
-        ha_url = ha_url if ha_url is not None else os.environ.get("ESPHOME_HA_URL")
-        ha_token = ha_token if ha_token is not None else os.environ.get("ESPHOME_HA_TOKEN")
+        e = os.environ.get
+        url = url or e("ESPHOME_DASHBOARD_URL")
+        username = username if username is not None else e("ESPHOME_DASHBOARD_USERNAME")
+        password = password if password is not None else e("ESPHOME_DASHBOARD_PASSWORD")
+        ha_url = ha_url if ha_url is not None else e("ESPHOME_HA_URL")
+        ha_token = ha_token if ha_token is not None else e("ESPHOME_HA_TOKEN")
         ha_addon_slug = (ha_addon_slug if ha_addon_slug is not None
-                         else os.environ.get("ESPHOME_HA_ADDON_SLUG")) or DEFAULT_HA_ADDON_SLUG
+                         else e("ESPHOME_HA_ADDON_SLUG")) or DEFAULT_HA_ADDON_SLUG
         if insecure is None:
-            insecure = os.environ.get("ESPHOME_DASHBOARD_INSECURE", "").lower() in ("1", "true", "yes")
+            insecure = e("ESPHOME_DASHBOARD_INSECURE", "").lower() in ("1", "true", "yes")
 
         if ha_url and ha_token:
             try:
@@ -853,9 +856,9 @@ def _is_html_response(status, headers, body):
 
 
 def _default_log_path(name, action):
-    base = os.environ.get("ESPHOME_BUILDER_LOG_DIR",
-                          os.path.join(os.path.expanduser("~"), ".cache",
-                                       "esphome-builder", "logs"))
+    base = (os.environ.get("ESPHOME_BUILDER_LOG_DIR")
+            or os.path.join(os.path.expanduser("~"), ".cache",
+                            "esphome-builder", "logs"))
     os.makedirs(base, mode=0o700, exist_ok=True)
     try:
         os.chmod(base, 0o700)
