@@ -832,11 +832,10 @@ def _normalize_exit_code(msg):
     code = msg.get("code") if "code" in msg else msg.get("data", {})
     if isinstance(code, dict):
         code = code.get("code", -1)
-    elif isinstance(code, int):
-        pass
-    else:
-        code = -1
-    return code
+    try:
+        return int(code)
+    except (ValueError, TypeError):
+        return -1
 
 
 def _is_html_body(body_bytes):
