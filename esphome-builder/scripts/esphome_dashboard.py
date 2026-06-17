@@ -1043,8 +1043,12 @@ def exists(conn, name):
 
 def get_config(conn, name):
     s, h, b = http_request(conn, "GET", "/edit", params={"configuration": norm(name)})
-    if _is_html_response(s, h, b):
+    if _is_html_response(s, h, b) or s == 404:
         return beta_get_config(conn, name)
+    if s == 401 or _login_redirect(s, h):
+        die("authentication required/failed. Provide --username/--password.")
+    if s >= 400:
+        die(f"GET /edit -> HTTP {s}: {b[:300].decode('utf-8','replace')}")
     return b.decode("utf-8", "replace")
 
 
