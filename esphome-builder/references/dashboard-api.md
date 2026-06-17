@@ -34,6 +34,44 @@ Behind a reverse proxy/custom domain, set `ESPHOME_TRUSTED_DOMAINS` (comma-
 separated hostnames) in the Builder's environment so WebSocket origin checks
 pass. The tool sends a same-origin `Origin` header to satisfy the default check.
 
+## Home Assistant ingress transport
+
+When ESPHome Builder runs as a Home Assistant add-on, the direct `:6052` port may
+not be exposed. In that case the correct ingress sequence mirrors Home
+Assistant's frontend and current Core/Supervisor source:
+
+1. Connect to Home Assistant's WebSocket endpoint: `ws(s)://HA/api/websocket`.
+2. Authenticate with a Home Assistant long-lived access token:
+   `{"type":"auth","access_token":"..."}`.
+3. Call the WebSocket command `supervisor/api` with `endpoint: "/addons/<slug>/info"`
+   (default ESPHome slug `5c53de3b_esphome`) to get `ingress_url`, usually
+   `/api/hassio_ingress/<ingress-token>/`.
+4. Call `supervisor/api` with `endpoint: "/ingress/session", method: "post"` to
+   get `{ "session": "..." }`.
+5. Send Builder HTTP and WebSocket requests through Home Assistant using the
+   ingress URL prefix and `Cookie: ingress_session=<session>`:
+   `/api/hassio_ingress/<ingress-token>/devices`,
+   `/api/hassio_ingress/<ingress-token>/logs`, etc.
+
+The session is short-lived (Supervisor extends valid sessions while used), so the
+CLI creates a fresh session during connection setup. If HA ingress cannot be
+created and `ESPHOME_DASHBOARD_URL` is set, the CLI falls back to direct Builder
+port communication.
+
+Source anchors used for this behavior:
+
+* Home Assistant frontend `src/data/hassio/ingress.ts`: `createHassioSession()`
+  calls `supervisor/api` `/ingress/session`, then sets
+  `document.cookie = ingress_session=...; path=/api/hassio_ingress/`.
+* Home Assistant Core `homeassistant/components/hassio/websocket_api.py`:
+  `websocket_supervisor_api()` forwards `supervisor/api`; for `/ingress/session`
+  it attaches the HA user id before calling Supervisor.
+* Home Assistant Core `homeassistant/components/hassio/ingress.py`: proxies
+  `/api/hassio_ingress/{token}/{path}` to Supervisor ingress and preserves
+  WebSocket support.
+* Home Assistant Supervisor `supervisor/api/ingress.py`: validates
+  `request.cookies["ingress_session"]` before proxying to the add-on.
+
 ## HTTP endpoints
 
 | Method | Path | Purpose |

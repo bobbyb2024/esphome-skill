@@ -8,15 +8,19 @@ the full log to a file (path shown) — read that file only if you need detail.
 ## Connect, map, inventory
 
 ```bash
-cp .env.example .env        # user fills in URL + (optional) creds; chmod 600; gitignore it
-python3 scripts/esphome_dashboard.py connect            # reads .env, verifies auth
+cp .env.example .env        # user fills ESPHOME_HA_* for ingress; optional ESPHOME_DASHBOARD_* fallback
+chmod 600 .env              # and gitignore it
+python3 scripts/esphome_dashboard.py connect            # HA ingress first, direct 6052 fallback next
 python3 scripts/esphome_dashboard.py enumerate --save   # cache API surface
 python3 scripts/esphome_dashboard.py status             # online + update-available
 python3 scripts/esphome_dashboard.py classify --all     # device classes
 ```
 
-Settings come from variables (CLI flags > real env > `.env`); no host or
+Settings come from variables (CLI flags > real env > `.env`); no host, token, or
 password is ever hardcoded. Use `--env-file PATH` to point at a specific `.env`.
+For HA add-on ingress, set `ESPHOME_HA_URL`, `ESPHOME_HA_TOKEN`, and usually keep
+`ESPHOME_HA_ADDON_SLUG=5c53de3b_esphome`; the tool creates the ingress session
+through Home Assistant and falls back to `ESPHOME_DASHBOARD_URL` if ingress fails.
 Use https://esphome.io/ as the default source for ESPHome docs and
 https://github.com/esphome/esphome for source-code behavior; Issues and PRs may
 inform fixes, but do not outrank official docs/source.
@@ -144,7 +148,12 @@ python3 scripts/esphome_dashboard.py backup --out ~/esphome-configs
 
 ## Troubleshooting
 
-* **401 / login redirect** → wrong/missing creds; re-run `connect`.
+* **HA ingress 401 / `No valid ingress session`** → the ingress cookie is missing
+  or expired. Re-run `connect`; it should create a fresh session through
+  Home Assistant `/api/websocket` (`supervisor/api` endpoint `/ingress/session`).
+  If that fails, check `ESPHOME_HA_URL`, admin-capable `ESPHOME_HA_TOKEN`, and
+  `ESPHOME_HA_ADDON_SLUG`; the tool will fall back to `ESPHOME_DASHBOARD_URL` if set.
+* **401 / login redirect on direct port** → wrong/missing direct Builder creds; re-run `connect`.
 * **TLS error** → self-signed cert; add `--insecure` (or set
   `ESPHOME_DASHBOARD_INSECURE=1`).
 * **WebSocket handshake failed** behind a proxy → set `ESPHOME_TRUSTED_DOMAINS`

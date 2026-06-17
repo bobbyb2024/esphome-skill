@@ -25,12 +25,15 @@ All connection settings live in environment variables, sourced (in precedence
 order) from: CLI flags > the real environment > a `.env` file. Nothing is
 hardcoded; nothing is stored outside `.env`.
 
-* CLI flags: --url --username --password --insecure --env-file
+* CLI flags: --url --username --password --ha-url --ha-token --ha-addon-slug --insecure --env-file
 * Variables (set in the real env or in `.env`):
-    ESPHOME_DASHBOARD_URL        e.g. http://HOST:6052
-    ESPHOME_DASHBOARD_USERNAME   (optional)
-    ESPHOME_DASHBOARD_PASSWORD   (optional)
-    ESPHOME_DASHBOARD_INSECURE   true/false (self-signed TLS)
+    ESPHOME_HA_URL              Home Assistant base URL for ingress, e.g. http://homeassistant.local:8123
+    ESPHOME_HA_TOKEN            Home Assistant long-lived access token for ingress
+    ESPHOME_HA_ADDON_SLUG       ESPHome add-on slug (default 5c53de3b_esphome)
+    ESPHOME_DASHBOARD_URL       direct fallback, e.g. http://HOST:6052
+    ESPHOME_DASHBOARD_USERNAME  direct fallback auth (optional)
+    ESPHOME_DASHBOARD_PASSWORD  direct fallback auth (optional)
+    ESPHOME_DASHBOARD_INSECURE  true/false (self-signed TLS)
     ESPHOME_BACKUP_DIR           (optional) default backup dir
     ESPHOME_BUILDER_LOG_DIR      (optional) where build logs are written
 * `.env` search order (first found wins, real env always wins over files):
@@ -57,11 +60,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+import difflib
 
 ENV_FILE_ENV = "ESPHOME_BUILDER_ENV"
 DEFAULT_ENV = os.path.expanduser("~/.config/esphome-builder/.env")
 CAPS_CACHE = os.path.expanduser("~/.config/esphome-builder/capabilities.json")
 DEFAULT_PORT = 6052
+DEFAULT_HA_ADDON_SLUG = "5c53de3b_esphome"
 
 SECRET_HINT_KEYS = ("password", "psk", "ssid", "key", "api_key", "token",
                     "ota_password", "encryption")
@@ -100,6 +105,10 @@ class BuilderHTTPError(Exception):
         super().__init__(f"HTTP {status}")
         self.status = status
         self.body = body
+
+
+class HAIngressError(Exception):
+    """Home Assistant ingress setup failed; direct Builder access may still work."""
 
 
 def out(obj_for_json, text_for_human=None):
@@ -200,11 +209,30 @@ def write_env_file(path, updates):
     return path
 
 
+def _probe_beta(conn):
+    """Check whether the Builder exposes a /ws beta WebSocket endpoint."""
+    try:
+        ws = WSClient(conn, "/ws", timeout=10).connect()
+        first = ws.recv_json()
+        ws.close()
+        return isinstance(first, dict) and "version" in str(first.get("type", "")).lower()
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # connection
 # --------------------------------------------------------------------------- #
+def _clean_path_prefix(path):
+    if not path:
+        return ""
+    return "/" + str(path).strip("/")
+
+
 class Conn:
-    def __init__(self, url, username="", password="", insecure=False):
+    def __init__(self, url, username="", password="", insecure=False, *,
+                 transport="direct", path_prefix="", ingress_session="",
+                 ha_token="", ha_addon_slug="", direct_url=""):
         url = url.strip()
         if "://" not in url:
             url = "http://" + url
@@ -217,16 +245,36 @@ class Conn:
         self.username = username or ""
         self.password = password or ""
         self.insecure = bool(insecure)
+        self.transport = transport
+        self.path_prefix = _clean_path_prefix(path_prefix)
+        self.ingress_session = ingress_session or ""
+        self.ha_token = ha_token or ""
+        self.ha_addon_slug = ha_addon_slug or ""
+        self.direct_url = direct_url or ""
+        self.beta_available = False  # set by _probe_beta after connect
+
+    @property
+    def base_origin(self):
+        return f"{self.scheme}://{self.host}:{self.port}"
 
     @property
     def origin(self):
-        return f"{self.scheme}://{self.host}:{self.port}"
+        return self.base_origin + self.path_prefix
 
     @property
     def ws_scheme(self):
         return "wss" if self.scheme == "https" else "ws"
 
+    def request_path(self, path):
+        path = "/" + str(path).lstrip("/")
+        return self.path_prefix + path
+
+    def url_for(self, path):
+        return self.base_origin + self.request_path(path)
+
     def auth_header(self):
+        if self.transport == "ha-ingress":
+            return {"Cookie": f"ingress_session={self.ingress_session}"}
         if self.username:
             raw = f"{self.username}:{self.password}".encode()
             return {"Authorization": "Basic " + base64.b64encode(raw).decode()}
@@ -240,31 +288,155 @@ class Conn:
         return ctx
 
     @classmethod
-    def load(cls, url=None, username=None, password=None, insecure=None):
+    def load(cls, url=None, username=None, password=None, insecure=None,
+             ha_url=None, ha_token=None, ha_addon_slug=None):
         # All settings come from variables (real env or a loaded .env file).
         url = url or os.environ.get("ESPHOME_DASHBOARD_URL")
         username = username if username is not None else os.environ.get("ESPHOME_DASHBOARD_USERNAME")
         password = password if password is not None else os.environ.get("ESPHOME_DASHBOARD_PASSWORD")
+        ha_url = ha_url if ha_url is not None else os.environ.get("ESPHOME_HA_URL")
+        ha_token = ha_token if ha_token is not None else os.environ.get("ESPHOME_HA_TOKEN")
+        ha_addon_slug = (ha_addon_slug if ha_addon_slug is not None
+                         else os.environ.get("ESPHOME_HA_ADDON_SLUG")) or DEFAULT_HA_ADDON_SLUG
         if insecure is None:
             insecure = os.environ.get("ESPHOME_DASHBOARD_INSECURE", "").lower() in ("1", "true", "yes")
+
+        if ha_url and ha_token:
+            try:
+                ingress = prepare_ha_ingress(ha_url, ha_token, ha_addon_slug, insecure=insecure)
+                conn = cls(
+                    ingress["ha_origin"],
+                    insecure=insecure,
+                    transport="ha-ingress",
+                    path_prefix=ingress["ingress_path"],
+                    ingress_session=ingress["session"],
+                    ha_token=ha_token,
+                    ha_addon_slug=ha_addon_slug,
+                    direct_url=url or "",
+                )
+                conn.beta_available = _probe_beta(conn)
+                return conn
+            except HAIngressError as exc:
+                if not url:
+                    die(f"Home Assistant ingress failed and no direct Builder URL is configured: {exc}")
+                progress(f"Home Assistant ingress unavailable ({exc}); falling back to direct Builder URL.")
+
         if not url:
-            die("no ESPHome Builder URL. Set ESPHOME_DASHBOARD_URL in your .env "
-                "(copy .env.example), pass --url, or run `connect --save`.")
-        return cls(url, username or "", password or "", insecure)
+            die("no ESPHome Builder connection. Set ESPHOME_HA_URL + ESPHOME_HA_TOKEN "
+                "for Home Assistant ingress, or set ESPHOME_DASHBOARD_URL / pass --url "
+                "for direct Builder access.")
+        conn = cls(url, username or "", password or "", insecure)
+        conn.beta_available = _probe_beta(conn)
+        return conn
 
     def save(self, path=None):
         """Write connection variables into a .env file, preserving other lines."""
         path = path or default_save_env_path()
-        updates = {"ESPHOME_DASHBOARD_URL": self.origin}
-        # Only write keys we actually have, so we never invent empty creds.
-        if self.username:
-            updates["ESPHOME_DASHBOARD_USERNAME"] = self.username
-        if self.password:
-            updates["ESPHOME_DASHBOARD_PASSWORD"] = self.password
+        if self.transport == "ha-ingress":
+            updates = {
+                "ESPHOME_HA_URL": self.base_origin,
+                "ESPHOME_HA_ADDON_SLUG": self.ha_addon_slug or DEFAULT_HA_ADDON_SLUG,
+            }
+            if self.ha_token:
+                updates["ESPHOME_HA_TOKEN"] = self.ha_token
+            if self.direct_url:
+                updates["ESPHOME_DASHBOARD_URL"] = self.direct_url
+        else:
+            updates = {"ESPHOME_DASHBOARD_URL": self.origin}
+            # Only write keys we actually have, so we never invent empty creds.
+            if self.username:
+                updates["ESPHOME_DASHBOARD_USERNAME"] = self.username
+            if self.password:
+                updates["ESPHOME_DASHBOARD_PASSWORD"] = self.password
         if self.insecure:
             updates["ESPHOME_DASHBOARD_INSECURE"] = "true"
         write_env_file(path, updates)
         return path
+
+
+def _ingress_path_from_url(ingress_url):
+    """Return /api/hassio_ingress/<token> from an add-on ingress_url."""
+    if not ingress_url:
+        raise HAIngressError("ESPHome add-on info did not include ingress_url")
+    parsed = urllib.parse.urlsplit(str(ingress_url))
+    path = parsed.path if parsed.scheme else str(ingress_url)
+    path = _clean_path_prefix(path)
+    if not path.startswith("/api/hassio_ingress/"):
+        raise HAIngressError(f"unexpected ingress_url path: {ingress_url!r}")
+    return path.rstrip("/")
+
+
+def ha_supervisor_api(ha_conn, ha_token, endpoint, method="get", *, data=None, params=None):
+    """Call Home Assistant's authenticated supervisor/api WebSocket command."""
+    try:
+        ws = WSClient(ha_conn, "/api/websocket", timeout=30).connect()
+    except (Exception, SystemExit) as exc:
+        raise HAIngressError(f"could not open Home Assistant websocket: {exc}") from exc
+    try:
+        first = ws.recv_json()
+        if not isinstance(first, dict):
+            raise HAIngressError("Home Assistant websocket closed before auth")
+        if first.get("type") == "auth_required":
+            ws.send_json({"type": "auth", "access_token": ha_token})
+            auth = ws.recv_json()
+            if not isinstance(auth, dict) or auth.get("type") != "auth_ok":
+                msg = auth.get("message") if isinstance(auth, dict) else auth
+                raise HAIngressError(f"Home Assistant websocket auth failed: {msg}")
+        elif first.get("type") != "auth_ok":
+            raise HAIngressError(f"unexpected Home Assistant websocket greeting: {first}")
+
+        req = {
+            "id": 1,
+            "type": "supervisor/api",
+            "endpoint": endpoint,
+            "method": method.lower(),
+        }
+        if data is not None:
+            req["data"] = data
+        if params is not None:
+            req["params"] = params
+        ws.send_json(req)
+        while True:
+            msg = ws.recv_json()
+            if msg is None:
+                raise HAIngressError(f"Home Assistant websocket closed waiting for {endpoint}")
+            if not isinstance(msg, dict) or msg.get("id") != 1:
+                continue
+            if not msg.get("success"):
+                err_obj = msg.get("error") or {}
+                if isinstance(err_obj, dict):
+                    message = err_obj.get("message") or err_obj.get("code") or err_obj
+                else:
+                    message = err_obj
+                raise HAIngressError(f"{endpoint} failed: {message}")
+            return msg.get("result") or {}
+    except HAIngressError:
+        raise
+    except Exception as exc:
+        raise HAIngressError(f"{endpoint} failed: {exc}") from exc
+    finally:
+        ws.close()
+
+
+def prepare_ha_ingress(ha_url, ha_token, addon_slug=DEFAULT_HA_ADDON_SLUG, *, insecure=False):
+    """Create a Home Assistant ingress session and resolve the ESPHome ingress URL."""
+    ha_conn = Conn(ha_url, insecure=insecure)
+    info = ha_supervisor_api(ha_conn, ha_token, f"/addons/{addon_slug}/info", "get")
+    if isinstance(info.get("data"), dict):
+        info = info["data"]
+    ingress_path = _ingress_path_from_url(info.get("ingress_url"))
+    session_result = ha_supervisor_api(ha_conn, ha_token, "/ingress/session", "post")
+    if isinstance(session_result.get("data"), dict):
+        session_result = session_result["data"]
+    session = session_result.get("session")
+    if not session:
+        raise HAIngressError("Home Assistant did not return an ingress session")
+    return {
+        "ha_origin": ha_conn.base_origin,
+        "ingress_path": ingress_path,
+        "session": session,
+        "addon_slug": addon_slug,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +458,7 @@ def _opener(conn):
 
 
 def http_request(conn, method, path, *, params=None, body=None, headers=None, timeout=30):
-    url = conn.origin + path
+    url = conn.url_for(path)
     if params:
         url += "?" + urllib.parse.urlencode(params)
     hdrs = {"Accept": "application/json, text/plain, */*"}
@@ -348,10 +520,11 @@ class WSClient:
         raw.settimeout(self.timeout)
         self.sock = raw
         key = base64.b64encode(os.urandom(16)).decode()
-        lines = [f"GET {self.path} HTTP/1.1", f"Host: {self.conn.host}:{self.conn.port}",
+        request_path = self.conn.request_path(self.path)
+        lines = [f"GET {request_path} HTTP/1.1", f"Host: {self.conn.host}:{self.conn.port}",
                  "Upgrade: websocket", "Connection: Upgrade",
                  f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13",
-                 f"Origin: {self.conn.origin}"]
+                 f"Origin: {self.conn.base_origin}"]
         for k, v in self.conn.auth_header().items():
             lines.append(f"{k}: {v}")
         self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
@@ -453,49 +626,142 @@ class WSClient:
             pass
 
 
-def _default_log_path(name, action):
-    base = os.environ.get("ESPHOME_BUILDER_LOG_DIR",
-                          os.path.join(os.path.expanduser("~"), ".cache",
-                                       "esphome-builder", "logs"))
-    os.makedirs(base, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(base, 0o700)
-    except OSError:
-        pass
-    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name or action)
-    return os.path.join(base, f"{safe}-{action}-{stamp}.log")
+class BetaWSClient:
+    """WebSocket client that speaks the Builder Beta command protocol.
 
-
-def _open_private_text(path):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    return os.fdopen(fd, "w", encoding="utf-8")
-
-
-def stream_command(conn, ws_path, spawn, *, mode="summary", tail=40, log_path=None,
-                   duration=None, lines=None, until=None, action="cmd", name=""):
-    """Run a Builder command over WebSocket.
-
-    mode="summary": full output -> log file; returns only a compact result and
-        (on failure) the error/tail lines. Best for compile/upload (context-cheap).
-    mode="stream": print every line live to stdout. Best for logs/run.
-
-    Bounds (logs/run): stop after `duration` seconds, `lines` lines, or when a
-    line matches `until` (regex). Returns a dict result.
+    Format:  {"command":"...","message_id":"1","args":{...}}
+    Response: {"message_id":"1","result":...}
+    Event:    {"message_id":"1","event":"...","data":"..."}
     """
+
+    def __init__(self, conn, path="/ws", timeout=900):
+        self._ws = WSClient(conn, path, timeout=timeout)
+        self._next_id = 1
+
+    def connect(self):
+        self._ws.connect()
+        # Discard the server_version hello message
+        try:
+            self._ws.recv_json()
+        except WSTimeout:
+            pass
+        return self
+
+    def set_timeout(self, t):
+        self._ws.set_timeout(t)
+
+    def send_command(self, command, args=None, message_id=None):
+        if message_id is None:
+            message_id = str(self._next_id); self._next_id += 1
+        self._ws.send_json({"command": command, "message_id": message_id,
+                            "args": args or {}})
+        return message_id
+
+    def recv_json(self):
+        while True:
+            msg = self._ws.recv_json()
+            if msg is None:
+                return None
+            if isinstance(msg, dict) and ("result" in msg or "event" in msg or "error_code" in msg):
+                return msg
+            # skip the initial server_version, auth messages, etc.
+            continue
+
+    def close(self):
+        self._ws.close()
+
+
+def beta_cmd(conn, command, args=None, *, timeout=60):
+    """Execute a single beta Builder WS command and return (success, result_or_error)."""
+    ws = BetaWSClient(conn, timeout=timeout).connect()
+    try:
+        mid = ws.send_command(command, args)
+        resp = ws.recv_json()
+        if resp is None:
+            return False, "websocket closed before response"
+        if "result" in resp:
+            return True, resp["result"]
+        if "error_code" in resp:
+            return False, f"{resp.get('error_code', '?')}: {resp.get('details', resp)}"
+        if "event" in resp:
+            return True, resp  # single event
+        return False, f"unexpected response: {resp}"
+    finally:
+        ws.close()
+
+
+def beta_get_config(conn, name):
+    ok, result = beta_cmd(conn, "devices/get_config",
+                          {"configuration": norm(name)})
+    if not ok:
+        die(f"beta get_config failed: {result}")
+    if not isinstance(result, str):
+        die(f"beta get_config returned unexpected type: {type(result).__name__}")
+    return result
+
+
+def beta_update_config(conn, name, text):
+    ok, result = beta_cmd(conn, "devices/update_config",
+                          {"configuration": norm(name), "content": text})
+    if not ok:
+        die(f"beta update_config failed: {result}")
+    return True
+
+
+def beta_validate_yaml(conn, name, content):
+    """Validate unsaved YAML content via editor/validate_yaml (beta API)."""
+    ok, result = beta_cmd(conn, "editor/validate_yaml",
+                          {"configuration": norm(name), "content": content})
+    if not ok:
+        die(f"beta validate_yaml failed: {result}")
+    return result
+
+
+def beta_compile(conn, name):
+    ok, result = beta_cmd(conn, "firmware/compile",
+                          {"configuration": norm(name)})
+    if not ok:
+        die(f"beta compile failed: {result}")
+    job_id = result.get("job_id") if isinstance(result, dict) else None
+    if not job_id:
+        die(f"beta compile did not return a job_id: {result}")
+    return job_id
+
+
+def beta_follow_job(conn, job_id, *, mode="summary", tail=40, log_path=None, name="",
+                    action="compile", duration=None):
+    """Stream build events from firmware/follow_job via the unified stream engine."""
+    ws = BetaWSClient(conn).connect()
+    ws.send_command("firmware/follow_job", {"job_id": job_id})
+    return _stream_events(ws, mode=mode, tail=tail, log_path=log_path,
+                          name=name, action=action, duration=duration)
+
+
+def beta_stream_command(conn, command, args, *, mode="summary", tail=40,
+                        log_path=None, name="", action="cmd", duration=None):
+    """Run a generic beta WS command with streaming events."""
+    ws = BetaWSClient(conn).connect()
+    ws.send_command(command, args)
+    return _stream_events(ws, mode=mode, tail=tail, log_path=log_path,
+                          name=name, action=action, duration=duration)
+
+
+def _stream_events(ws, *, mode="summary", tail=40, log_path=None,
+                   name="", action="cmd", duration=None, lines=None, until=None):
+    """Core streaming event engine — shared by old and beta WebSocket protocols.
+
+    Accepts any connected websocket with recv_json()/set_timeout()/close().
+    Processes line/exit/error events generically and returns a compact result.
+    """
+    import time as _t
     until_re = re.compile(until) if until else None
     if log_path is None and mode == "summary":
         log_path = _default_log_path(name, action)
     logf = _open_private_text(log_path) if log_path else None
     recent = deque(maxlen=max(tail, 60))
-    errors = []
-    count = 0
-    code, stopped = None, "closed"
-    import time as _t
+    errors, count, stopped, code = [], 0, "exit", None
     deadline = (_t.monotonic() + duration) if duration else None
-    ws = WSClient(conn, ws_path).connect()
     try:
-        ws.send_json({"type": "spawn", **spawn})
         while True:
             if deadline is not None:
                 remaining = deadline - _t.monotonic()
@@ -528,17 +794,25 @@ def stream_command(conn, ws_path, spawn, *, mode="summary", tail=40, log_path=No
                 if lines and count >= lines:
                     stopped = "lines"; break
             elif ev == "exit":
-                code = int(msg.get("code", -1)); stopped = "exit"; break
+                code = _normalize_exit_code(msg)
+                stopped = "exit"; break
+            # beta-specific: error_code message
+            if "error_code" in msg:
+                errors.append(f"error: {msg.get('error_code')}: {msg.get('details', msg)}")
+                stopped = "error"; break
+            # beta-specific: bare result = done
+            if "result" in msg and not ev:
+                stopped = "done"; code = 0; break
     finally:
-        ws.close()
+        try:
+            ws.close()
+        except (AttributeError, OSError):
+            pass
         if logf:
             logf.close()
     if stopped == "exit":
         ok = (code == 0)
     elif action == "logs":
-        # Bounded log sampling is a successful read. For build/deploy commands
-        # (especially `run`), a bound hit before an exit event is indeterminate
-        # and must not be reported as a successful compile/upload.
         ok = stopped in ("duration", "lines", "until")
     else:
         ok = False
@@ -548,6 +822,67 @@ def stream_command(conn, ws_path, spawn, *, mode="summary", tail=40, log_path=No
         result["error_lines"] = errors[:30]
         result["tail"] = [l.rstrip("\n") for l in list(recent)[-tail:]]
     return result
+
+
+def _normalize_exit_code(msg):
+    """Extract exit code from either old-format {code: N} or beta-format {data: {code: N}}."""
+    code = msg.get("code") if "code" in msg else msg.get("data", {})
+    if isinstance(code, dict):
+        code = code.get("code", -1)
+    elif isinstance(code, int):
+        pass
+    else:
+        code = -1
+    return code
+
+
+def _is_html_body(body_bytes):
+    """Return True if the response body looks like HTML/SPA, not plain YAML/JSON."""
+    try:
+        prefix = body_bytes[:512].decode("utf-8", "replace").lstrip().lower()
+    except UnicodeDecodeError:
+        return False
+    return prefix.startswith(("<!doctype", "<html", "<!DOCTYPE", "<HTML"))
+
+
+def _is_html_response(status, headers, body):
+    """Return True if the HTTP response is likely SPA HTML rather than YAML/JSON."""
+    ct = (headers or {}).get("Content-Type", "").lower()
+    if "text/html" in ct:
+        return True
+    return _is_html_body(body)
+
+
+def _default_log_path(name, action):
+    base = os.environ.get("ESPHOME_BUILDER_LOG_DIR",
+                          os.path.join(os.path.expanduser("~"), ".cache",
+                                       "esphome-builder", "logs"))
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(base, 0o700)
+    except OSError:
+        pass
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name or action)
+    return os.path.join(base, f"{safe}-{action}-{stamp}.log")
+
+
+def _open_private_text(path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
+
+
+def stream_command(conn, ws_path, spawn, *, mode="summary", tail=40, log_path=None,
+                   duration=None, lines=None, until=None, action="cmd", name=""):
+    """Run a Builder command over WebSocket (old format: {"type":"spawn",...}).
+
+    Thin wrapper around _stream_events — sends the spawn command, then delegates.
+    """
+    ws = WSClient(conn, ws_path).connect()
+    ws.send_json({"type": "spawn", **spawn})
+    return _stream_events(ws, mode=mode, tail=tail, log_path=log_path,
+                          name=name, action=action, duration=duration,
+                          lines=lines, until=until)
 
 
 def print_build_result(res, label):
@@ -606,6 +941,27 @@ def save_caps(conn, version, endpoints):
     with open(CAPS_CACHE, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
     return CAPS_CACHE
+
+
+# --------------------------------------------------------------------------- #
+# serial ports
+# --------------------------------------------------------------------------- #
+def list_serial_ports(conn):
+    """Enumerate available serial ports for flashing.
+    Tries old HTTP endpoint first, falls back to beta config/serial_ports."""
+    s, _, b = http_request(conn, "GET", "/serial-ports", timeout=10)
+    if s == 200:
+        try:
+            data = json.loads(b.decode("utf-8", "replace"))
+            if isinstance(data, (list, dict)):
+                return data
+        except json.JSONDecodeError:
+            pass
+    if conn.beta_available:
+        ok, result = beta_cmd(conn, "config/serial_ports", {})
+        if ok:
+            return result
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -684,12 +1040,17 @@ def exists(conn, name):
 
 
 def get_config(conn, name):
-    return get_text(conn, "/edit", params={"configuration": norm(name)})
+    s, h, b = http_request(conn, "GET", "/edit", params={"configuration": norm(name)})
+    if _is_html_response(s, h, b):
+        return beta_get_config(conn, name)
+    return b.decode("utf-8", "replace")
 
 
 def _post_config(conn, name, text):
     s, h, b = http_request(conn, "POST", "/edit", params={"configuration": norm(name)},
                            body=text, headers={"Content-Type": "text/plain; charset=utf-8"})
+    if _is_html_response(s, h, b) or s == 404:
+        return beta_update_config(conn, name, text)
     if s == 401 or _login_redirect(s, h):
         die("authentication required to save config.")
     if s >= 400:
@@ -847,6 +1208,27 @@ def classify_device(conn, name, deep=False):
 
 
 # --------------------------------------------------------------------------- #
+# diff
+# --------------------------------------------------------------------------- #
+def diff_config(conn, name, local_path):
+    """Compare a local YAML file against the Builder's saved version.
+    Returns a dict with added/removed/changed lines for agent review."""
+    with open(local_path, encoding="utf-8") as fh:
+        local_lines = fh.read().splitlines(True)
+    remote = get_config(conn, name)
+    remote_lines = remote.splitlines(True)
+    diff = list(difflib.unified_diff(
+        remote_lines, local_lines,
+        fromfile=f"Builder/{norm(name)}", tofile=local_path,
+        lineterm=""))
+    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+    return {"name": norm(name), "local": local_path,
+            "added": added, "removed": removed,
+            "diff": "".join(diff), "changed": added > 0 or removed > 0}
+
+
+# --------------------------------------------------------------------------- #
 # status / backup / watch
 # --------------------------------------------------------------------------- #
 def builder_version(conn):
@@ -983,14 +1365,26 @@ def add_common(p):
     p.add_argument("--url")
     p.add_argument("--username")
     p.add_argument("--password")
+    p.add_argument("--ha-url", help="Home Assistant URL for ingress (sets ESPHOME_HA_URL)")
+    p.add_argument("--ha-token", help="Home Assistant long-lived access token for ingress")
+    p.add_argument("--ha-addon-slug", help=f"ESPHome add-on slug for ingress (default {DEFAULT_HA_ADDON_SLUG})")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed certs)")
+    p.add_argument("--beta", action="store_true", help="use Builder beta WebSocket API (/ws, new command format)")
     p.add_argument("--env-file", help="path to a .env file (default search: ./.env then ~/.config/esphome-builder/.env)")
     p.add_argument("--json", action="store_true", help="machine-parseable output")
 
 
 def conn_from(a):
     load_env_files(getattr(a, "env_file", None))
-    return Conn.load(a.url, a.username, a.password, True if a.insecure else None)
+    return Conn.load(
+        a.url,
+        a.username,
+        a.password,
+        True if a.insecure else None,
+        ha_url=getattr(a, "ha_url", None),
+        ha_token=getattr(a, "ha_token", None),
+        ha_addon_slug=getattr(a, "ha_addon_slug", None),
+    )
 
 
 def _maybe_json(a):
@@ -1034,6 +1428,7 @@ def build_parser():
 
     def get_args(s):
         s.add_argument("name"); s.add_argument("-o", "--out")
+        s.add_argument("--diff", help="compare to a local file (shows unified diff)")
     cmd("get", "fetch a device YAML", get_args)
 
     def put_args(s):
@@ -1072,7 +1467,8 @@ def build_parser():
     def target_args(s):
         s.add_argument("name", nargs="?")
         s.add_argument("--match", help="glob over configured devices (batch)")
-    cmd("validate", "validate config(s)", target_args)
+        s.add_argument("-f", "--file", help="local YAML to validate before saving (uses beta editor/validate_yaml)")
+    cmd("validate", "validate config(s) — saved or local file", target_args)
     cmd("compile", "compile firmware on the Builder", target_args)
     cmd("clean", "clean build files", target_args)
 
@@ -1120,6 +1516,9 @@ def build_parser():
     def watch_args(s):
         s.add_argument("name"); s.add_argument("--timeout", type=int, default=180)
     cmd("watch", "wait for a device to come online (post-OTA)", watch_args)
+    cmd("serial-ports", "list available serial ports for flashing")
+    cmd("diff", "compare local YAML against Builder saved version",
+        lambda s: [s.add_argument("name"), s.add_argument("local")])
 
     def lint_args(s):
         s.add_argument("-f", "--file", required=True)
@@ -1185,6 +1584,20 @@ def main(argv=None):
 
     conn = conn_from(a)
 
+    if a.cmd == "serial-ports":
+        ports = list_serial_ports(conn)
+        out(ports, json.dumps(ports, indent=2))
+        return 0
+
+    if a.cmd == "diff":
+        result = diff_config(conn, a.name, a.local)
+        if result["changed"]:
+            print(result["diff"])
+            print(f"\n+{result['added']} -{result['removed']} lines changed")
+        else:
+            print("no differences")
+        return 0 if not result["changed"] else 1
+
     if a.cmd == "connect":
         v = builder_version(conn)
         out({"ok": True, "builder": conn.origin, "esphome_version": v},
@@ -1231,6 +1644,15 @@ def main(argv=None):
         return 0
 
     if a.cmd == "get":
+        if getattr(a, "diff", None):
+            result = diff_config(conn, a.name, a.diff)
+            if result["changed"]:
+                print(result["diff"])
+                print(f"\n-- Builder/{result['name']}  ++  {result['local']}")
+                print(f"+{result['added']} -{result['removed']} lines changed")
+            else:
+                print("no differences")
+            return 0 if not result["changed"] else 1
         text = get_config(conn, a.name)
         if a.out:
             with open(a.out, "w", encoding="utf-8") as fh:
@@ -1292,12 +1714,86 @@ def main(argv=None):
         print_build_result(res, "rename")
         return 0 if res["ok"] else 1
 
+    if a.cmd == "validate" and getattr(a, "file", None):
+        with open(a.file, encoding="utf-8") as fh:
+            local_text = fh.read()
+        cfg_name = a.name or os.path.basename(a.file)
+        result = beta_validate_yaml(conn, cfg_name, local_text)
+        out({"ok": True, "name": norm(cfg_name), "result": result},
+            f"[validate] {norm(cfg_name)}: OK")
+        return 0
+
     if a.cmd in ("validate", "compile", "clean"):
+        if conn.beta_available and not getattr(a, "beta", False) and a.cmd != "clean":
+            names = expand_targets(conn, a.name, getattr(a, "match", None))
+            action = {"validate": "devices/validate", "compile": "firmware/compile"}[a.cmd]
+            all_ok = True
+            for i, fn in enumerate(names):
+                if len(names) > 1:
+                    progress(f"== {a.cmd} {fn} ({i+1}/{len(names)}) ==")
+                if a.cmd == "validate":
+                    ok, result = beta_cmd(conn, action, {"configuration": fn})
+                    if ok:
+                        out({"ok": True, "name": fn, "result": result},
+                            f"[{a.cmd}] {fn}: OK")
+                    else:
+                        out({"ok": False, "name": fn, "error": result},
+                            f"[{a.cmd}] {fn}: FAILED")
+                        all_ok = False
+                else:
+                    job_id = beta_compile(conn, fn)
+                    progress(f"  job_id: {job_id}")
+                    res = beta_follow_job(conn, job_id, mode="summary", name=fn, action=a.cmd)
+                    print_build_result(res, a.cmd)
+                    if not res["ok"]:
+                        all_ok = False
+            return 0 if all_ok else 1
+        if getattr(a, "beta", False):
+            if a.cmd == "clean":
+                out({"ok": True}, "clean not yet supported in beta mode")
+                return 0
+            names = expand_targets(conn, a.name, getattr(a, "match", None))
+            action = {"validate": "devices/validate", "compile": "firmware/compile"}[a.cmd]
+            all_ok = True
+            for fn in names:
+                if len(names) > 1:
+                    progress(f"== {a.cmd} {fn} ==")
+                if a.cmd == "validate":
+                    ok, result = beta_cmd(conn, action, {"configuration": fn})
+                    if ok:
+                        out({"ok": True, "name": fn, "result": result},
+                            f"[{a.cmd}] {fn}: OK")
+                    else:
+                        out({"ok": False, "name": fn, "error": result},
+                            f"[{a.cmd}] {fn}: FAILED — {result}")
+                        all_ok = False
+                else:  # compile
+                    job_id = beta_compile(conn, fn)
+                    progress(f"  job_id: {job_id}")
+                    res = beta_follow_job(conn, job_id, mode="summary", name=fn, action=a.cmd)
+                    print_build_result(res, a.cmd)
+                    if not res["ok"]:
+                        all_ok = False
+            return 0 if all_ok else 1
         ws = {"validate": "/validate", "compile": "/compile", "clean": "/clean"}[a.cmd]
         return run_target_batch(conn, a, ws, a.cmd, mode="summary")
 
     if a.cmd == "upload":
         mode = "stream" if a.verbose else "summary"
+        if conn.beta_available or getattr(a, "beta", False):
+            names = expand_targets(conn, a.name, getattr(a, "match", None))
+            all_ok = True
+            for i, fn in enumerate(names):
+                if len(names) > 1:
+                    progress(f"== upload {fn} ({i+1}/{len(names)}) ==")
+                job_id = beta_compile(conn, fn)
+                progress(f"  job_id: {job_id}")
+                res = beta_follow_job(conn, job_id, mode=mode, name=fn, action="upload",
+                                      duration=getattr(a, "duration", None))
+                print_build_result(res, "upload")
+                if not res["ok"]:
+                    all_ok = False
+            return 0 if all_ok else 1
         return run_target_batch(conn, a, "/upload", "upload", mode=mode, port=a.port)
 
     if a.cmd in ("logs", "run"):
