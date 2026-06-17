@@ -17,6 +17,9 @@ python3 scripts/esphome_dashboard.py classify --all     # device classes
 
 Settings come from variables (CLI flags > real env > `.env`); no host or
 password is ever hardcoded. Use `--env-file PATH` to point at a specific `.env`.
+Use https://esphome.io/ as the default source for ESPHome docs and
+https://github.com/esphome/esphome for source-code behavior; Issues and PRs may
+inform fixes, but do not outrank official docs/source.
 
 ## Create a device (recommended: minimal file with !secret)
 
@@ -116,14 +119,27 @@ python3 scripts/esphome_dashboard.py compile desk-plug \
 
 `update-all` (the Builder's own "update everything to current") exists but
 ignores class policy — prefer the per-class flow above unless the user explicitly
-wants a blanket update.
+wants a blanket update. It is guarded and requires:
+
+```bash
+python3 scripts/esphome_dashboard.py update-all --confirm update-all
+```
+
+## Destructive operations
+
+```bash
+python3 scripts/esphome_dashboard.py rename old-name new-name --confirm old-name
+python3 scripts/esphome_dashboard.py delete old-name --confirm old-name
+```
+
+The confirmation must match the current config name (with or without `.yaml`).
 
 ## Backup for git
 
 ```bash
 python3 scripts/esphome_dashboard.py backup --out ~/esphome-configs
-# writes every device YAML + MANIFEST.json. Configs contain only !secret refs,
-# never values, so they're safe to commit (keep secrets.yaml out of git).
+# writes every device YAML + MANIFEST.json. Check MANIFEST.json for
+# inline_secret_findings before committing backups; keep secrets.yaml out of git.
 ```
 
 ## Troubleshooting
@@ -133,9 +149,13 @@ python3 scripts/esphome_dashboard.py backup --out ~/esphome-configs
   `ESPHOME_DASHBOARD_INSECURE=1`).
 * **WebSocket handshake failed** behind a proxy → set `ESPHOME_TRUSTED_DOMAINS`
   on the Builder, or hit it directly by IP:port.
-* **compile fails on a component/option** → check that component on esphome.io
-  for the Builder's version (`enumerate` reports it); fix YAML; re-`validate`.
+* **compile fails on a component/option** → check that component on
+  https://esphome.io/ for the Builder's version (`enumerate` reports it), and
+  inspect https://github.com/esphome/esphome when docs are insufficient; Issues
+  and PRs can inform a fix but do not outrank official docs/code.
 * **OTA can't find the device** → `status`/`watch` to confirm online; mDNS may
   be down across VLANs; flash once over serial to seed Wi-Fi.
 * **secret not found at compile** → `secrets --check NAME`; have the user add the
   missing key (never inline the value).
+* **backup reports inline secret findings** → do not commit that backup until the
+  YAML is migrated to `!secret` references or the user explicitly accepts the risk.

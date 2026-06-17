@@ -1,0 +1,20 @@
+# Hermes local workspace artifacts
+.hermes/
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+
+# Local secrets/config
+.env
+*.env
+!.env.example
+
+# Generated package artifacts
+dist/
+*.tar.gz
+
+# ESPHome Builder local output
+esphome-backup/
+capabilities.json
+*.log

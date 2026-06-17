@@ -8,16 +8,20 @@ building blocks (`classify`, `status`, `backup`, `validate`, `compile`,
 
 ## Golden rules
 
-1. Compile → validate → only then install. Never push uncompiled firmware.
+1. Validate → compile → only then install/upload. Never push firmware you have not successfully validated and compiled.
 2. Never force an update that requires a config change unless the device is in
    an actively-managed class (`bluetooth-proxy` or `sendspin-player`).
    "Requires a config change" = the current YAML no longer compiles against the
    current ESPHome version and the fix needs a YAML edit.
 3. Class is determined by inspection (`classify`), not by device name.
 4. Back up before any YAML write or OTA (`backup`).
-5. Confirm before destructive acts (delete, rename, factory reset) in the same
-   turn.
-6. Serial fallback is never automatic — report an OTA failure; don't tell the
+5. Confirm before destructive acts (`delete`, `rename`, factory reset) in the
+   same turn; CLI `delete`/`rename` require `--confirm NAME`, and `update-all`
+   requires `--confirm update-all`.
+6. Use https://esphome.io/ for ESPHome docs and
+   https://github.com/esphome/esphome for source-code truth. Issues/PRs may
+   inform fixes, but official docs/source win by default.
+7. Serial fallback is never automatic — report an OTA failure; don't tell the
    user to plug in USB unless they ask.
 
 ## Classification (first match wins)

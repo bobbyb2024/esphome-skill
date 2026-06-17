@@ -4,7 +4,9 @@ The ESPHome Builder (Dashboard) is a Tornado web app, usually on port `6052`.
 It exposes a small HTTP API plus several **WebSocket command** endpoints that
 spawn the `esphome` CLI on the Builder and stream its output. Paths vary
 slightly across versions, so `scripts/esphome_dashboard.py enumerate` probes the
-live instance — treat its output as authoritative for a given Builder.
+live instance. For API behavior beyond the live probe, use
+https://github.com/esphome/esphome as the source-code truth; Issues and PRs may
+inform a fix but do not outrank official source.
 
 > You normally don't need this file: the tool wraps every endpoint below. Read
 > it only to debug an odd Builder version or extend the tool. Build/log output
