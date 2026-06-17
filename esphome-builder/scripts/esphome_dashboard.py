@@ -840,11 +840,8 @@ def _normalize_exit_code(msg):
 
 def _is_html_body(body_bytes):
     """Return True if the response body looks like HTML/SPA, not plain YAML/JSON."""
-    try:
-        prefix = body_bytes[:512].decode("utf-8", "replace").lstrip().lower()
-    except UnicodeDecodeError:
-        return False
-    return prefix.startswith(("<!doctype", "<html", "<!DOCTYPE", "<HTML"))
+    prefix = body_bytes[:512].decode("utf-8", "replace").lstrip().lower()
+    return prefix.startswith(("<!doctype", "<html"))
 
 
 def _is_html_response(status, headers, body):
@@ -1043,22 +1040,26 @@ def exists(conn, name):
 
 def get_config(conn, name):
     s, h, b = http_request(conn, "GET", "/edit", params={"configuration": norm(name)})
-    if _is_html_response(s, h, b) or s == 404:
-        return beta_get_config(conn, name)
     if s == 401 or _login_redirect(s, h):
         die("authentication required/failed. Provide --username/--password.")
+    if s == 404:
+        return beta_get_config(conn, name)
     if s >= 400:
         die(f"GET /edit -> HTTP {s}: {b[:300].decode('utf-8','replace')}")
+    if _is_html_response(s, h, b):
+        return beta_get_config(conn, name)
     return b.decode("utf-8", "replace")
 
 
 def _post_config(conn, name, text):
     s, h, b = http_request(conn, "POST", "/edit", params={"configuration": norm(name)},
                            body=text, headers={"Content-Type": "text/plain; charset=utf-8"})
-    if _is_html_response(s, h, b) or s == 404:
-        return beta_update_config(conn, name, text)
     if s == 401 or _login_redirect(s, h):
         die("authentication required to save config.")
+    if s == 404:
+        return beta_update_config(conn, name, text)
+    if _is_html_response(s, h, b):
+        return beta_update_config(conn, name, text)
     if s >= 400:
         raise BuilderHTTPError(s, b)
     return True
