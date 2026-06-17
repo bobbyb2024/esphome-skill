@@ -211,13 +211,16 @@ def write_env_file(path, updates):
 
 def _probe_beta(conn):
     """Check whether the Builder exposes a /ws beta WebSocket endpoint."""
+    ws = None
     try:
         ws = WSClient(conn, "/ws", timeout=10).connect()
         first = ws.recv_json()
-        ws.close()
         return isinstance(first, dict) and "version" in str(first.get("type", "")).lower()
     except Exception:
         return False
+    finally:
+        if ws:
+            ws.close()
 
 
 # --------------------------------------------------------------------------- #
